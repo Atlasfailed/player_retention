@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XGBoost Game Outcome Prediction Report</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f9f9f9;
+        }
+        .container {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1, h2, h3 {
+            color: #0366d6;
+        }
+        pre {
+            background-color: #f6f8fa;
+            border-radius: 3px;
+            font-size: 85%;
+            line-height: 1.45;
+            overflow: auto;
+            padding: 16px;
+        }
+        code {
+            background-color: rgba(27,31,35,.05);
+            border-radius: 3px;
+            font-size: 85%;
+            margin: 0;
+            padding: .2em .4em;
+        }
+        .result {
+            background-color: #e6f3ff;
+            border-left: 3px solid #2196F3;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .interpretation {
+            background-color: #e8f5e9;
+            border-left: 3px solid #4CAF50;
+            padding: 15px;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>XGBoost Game Outcome Prediction Report</h1>
+        
+        <h2>1. Data Loading and Preprocessing</h2>
+        <pre><code>
+def load_data():
+    matches_df = pd.read_parquet('matches.parquet')
+    players_df = pd.read_parquet('match_players.parquet')
+    
+    players_df.rename(columns={
+        'new_skill': 'mu',
+        'new_uncertainty': 'sigma'
+    }, inplace=True)
+    
+    players_df['match_rating'] = players_df['mu'] - players_df['sigma']
+    matches_df['start_time'] = pd.to_datetime(matches_df['start_time'])
+    
+    if 'game_duration' not in matches_df.columns:
+        matches_df['game_duration'] = (matches_df['end_time'] - matches_df['start_time']).dt.total_seconds()
+    
+    return matches_df, players_df
+
+matches_df, players_df = load_data()
+        </code></pre>
+        
+        <p>This code loads the match and player data from parquet files, renames some columns for clarity, calculates the match rating, and ensures the 'game_duration' column exists.</p>
+        
+        <div class="result">
+            <h3>Result:</h3>
+            <p>Data loaded successfully:</p>
+            <ul>
+                <li>534,380 matches</li>
+                <li>5,020,329 player records</li>
+                <li>75,016 unique players</li>
+            </ul>
+        </div>
+        
+        <div class="interpretation">
+            <h3>Interpretation:</h3>
+            <p>The dataset is substantial, with over half a million matches and 5 million player records.</p>
+        </div>
+        
+        <h2>2. Data Preparation for Modeling</h2>
+        <pre><code>
+def prepare_data_for_modeling(matches_df, players_df):
+    data = players_df.merge(matches_df, on='match_id')
+    
+    ranked_team_matches = data[
+        (data['is_ranked'] == True) & 
+        (data['game_type'].isin(['Large Team', 'Small Team', 'Team']))
+    ]
+    
+    features = ['match_rating', 'mu', 'sigma']
+    X = ranked_team_matches[features]
+    
+    y = (ranked_team_matches['team_id'] == ranked_team_matches['winning_team']).astype(int)
+    
+    X['match_avg_rating'] = ranked_team_matches.groupby('match_id')['match_rating'].transform('mean')
+    X['match_max_rating'] = ranked_team_matches.groupby('match_id')['match_rating'].transform('max')
+    X['match_min_rating'] = ranked_team_matches.groupby('match_id')['match_rating'].transform('min')
+    X['match_rating_spread'] = X['match_max_rating'] - X['match_min_rating']
+    
+    X['team_avg_rating'] = ranked_team_matches.groupby(['match_id', 'team_id'])['match_rating'].transform('mean')
+    X['team_max_rating'] = ranked_team_matches.groupby(['match_id', 'team_id'])['match_rating'].transform('max')
+    X['team_min_rating'] = ranked_team_matches.groupby(['match_id', 'team_id'])['match_rating'].transform('min')
+    X['team_rating_spread'] = X['team_max_rating'] - X['team_min_rating']
+    
+    return X, y
+
+X, y = prepare_data_for_modeling(matches_df, players_df)
+        </code></pre>
+        
+        <p>This code prepares the data for modeling by merging match and player data, filtering for ranked team matches, creating features, and defining the target variable (win/loss).</p>
+        
+        <div class="result">
+            <h3>Result: Feature Creation and Dataset Characteristics</h3>
+            <p>In our data preparation process, we've engineered a set of features that capture various aspects of player and team performance. These features can be broadly categorized into three groups: individual player metrics, match-level statistics, and team-based measures.</p>
+            
+            <p>At the individual level, we have 'match_rating', 'mu', and 'sigma'. The 'match_rating' is derived from a player's skill rating (mu) and uncertainty (sigma), representing their overall performance capability. 'Mu' indicates the estimated skill level of a player, while 'sigma' represents the uncertainty in this estimate. A lower sigma suggests a more reliable skill rating.</p>
+            
+            <p>For match-level insights, we've calculated 'match_avg_rating', 'match_max_rating', 'match_min_rating', and 'match_rating_spread'. These features provide a holistic view of the skill distribution within a match. The average rating gives us a sense of the overall skill level of the match, while the maximum and minimum ratings highlight the skill range. The rating spread, calculated as the difference between the max and min ratings, indicates the degree of skill disparity among players in the match.</p>
+            
+            <p>Team-based features mirror the match-level statistics but are calculated for each team separately. 'team_avg_rating', 'team_max_rating', 'team_min_rating', and 'team_rating_spread' offer insights into team composition and balance. These features allow us to compare teams within a match and potentially identify mismatches or balanced matchups.</p>
+            
+            <p>Our prepared dataset consists of 4,202,798 samples, each with 11 features (shape of X). The target variable (y) has the same number of samples, each representing whether a team won (1) or lost (0) the match.</p>
+            
+                </div>
+        
+        <div class="interpretation">
+            <h3>Interpretation: Significance of Feature Engineering</h3>
+            <p>The features we've engineered provide a multi-dimensional view of the factors that might influence match outcomes. By incorporating individual, team, and match-level statistics, we're giving our model a comprehensive set of inputs to learn from.</p>
+            
+            <p>The inclusion of both average and extreme (max/min) ratings allows the model to consider not just the typical skill level but also the impact of exceptionally skilled or less skilled players. The rating spread features could help the model identify when skill disparities might play a crucial role in match outcomes.</p>
+            
+            <p>Our approach to feature engineering reflects the complex nature of team-based competitive games. We're not just looking at individual performance, but how individuals come together as teams and how teams compare within a match. This multi-level approach should allow our model to capture nuanced patterns in how different aspects of player and team skill contribute to match results.</p>
+            
+            <p>As we move forward with our analysis, we'll be able to see how these carefully crafted features contribute to our model's predictions and gain insights into which aspects of player and team performance are most crucial in determining match outcomes.</p>
+        </div>
+        
+        <h2>3. Model Training and Evaluation</h2>
+        <pre><code>
+def train_and_evaluate_model(X, y):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    xgb_model = XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=42)
+    xgb_model.fit(X_train, y_train)
+    
+    y_pred = xgb_model.predict(X_test)
+    
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Model Accuracy: {accuracy:.4f}")
+    
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+    
+    return xgb_model, X_test, y_test, y_pred
+
+model, X_test, y_test, y_pred = train_and_evaluate_model(X, y)
+        </code></pre>
+        
+        <p>In this section, we employ XGBoost (eXtreme Gradient Boosting) for our prediction task. XGBoost is an advanced implementation of gradient boosting machines, known for its efficiency and performance in various machine learning competitions.</p>
+        
+        <p>The 'Gradient' in XGBoost is a fundamental concept that drives the algorithm's learning process. To understand it, we need to consider how XGBoost builds its predictive model.</p>
+        <p>XGBoost is a boosting algorithm, which means it constructs its final model by combining many simpler models, typically decision trees. This process happens iteratively, with each new tree aiming to correct the mistakes of all the previously added trees combined.</p>
+        <p>At the heart of this process is the loss function. This function measures how far off the model's predictions are from the actual values in the training data. The goal of the learning process is to minimize this loss function, thereby improving the model's accuracy.</p>
+        <p>This is where the concept of 'gradient' comes into play. In mathematical terms, the gradient of a function points in the direction of the steepest increase of that function. In the context of XGBoost, we're interested in the gradient of the loss function with respect to the model's current predictions.</p>
+        <p>After each iteration, XGBoost calculates this gradient for every data point in the training set. These gradients essentially represent the residual errors of the current model – they indicate how the predictions need to change to reduce the loss function.</p>
+        <p>The clever part of XGBoost's approach is how it uses these gradients. Instead of directly adjusting the existing trees, XGBoost trains the next tree in the ensemble to predict these gradients. By adding this new tree (scaled by a small learning rate) to the ensemble, the model effectively moves in the direction that reduces the loss function.</p>
+        <p>This process is analogous to the gradient descent optimization technique used in many machine learning algorithms. However, instead of updating numeric parameters, XGBoost is "descending" the gradient by adding new trees to its ensemble.</p>
+        <p>The 'Gradient' in XGBoost, therefore, refers to this sophisticated process of using the gradient of the loss function to guide the construction of new trees. It's a more nuanced approach than simply trying to correct raw errors, as it takes into account the shape of the loss function.</p>
+        <p>This gradient-based approach allows XGBoost to efficiently find improvements to its predictions, contributing to the algorithm's renowned speed and accuracy. It's a prime example of how advanced mathematical concepts can be applied to create powerful machine learning algorithms.</p><p>One of XGBoost's key advantages is its speed and performance. It employs various optimization techniques, including parallel processing and efficient handling of sparse data, making it significantly faster than traditional gradient boosting implementations. XGBoost also includes built-in regularization, which helps prevent overfitting, a common problem in machine learning.</p>
+        
+        <p>Another strength of XGBoost is its flexibility. It can handle a variety of loss functions and is effective for both classification and regression tasks. The algorithm also provides importance scores for each feature, offering insights into which variables are most crucial for making predictions.</p>
+        
+        <p>However, XGBoost is not without its drawbacks. The model can be prone to overfitting, especially with small datasets, although this can often be mitigated through careful tuning of hyperparameters. XGBoost models can also be more challenging to interpret compared to simpler models like linear regression or single decision trees. While feature importance scores provide some insight, understanding the complex interactions between features in the model can be difficult.</p>
+        
+        <p>In our implementation, we use XGBClassifier with 100 estimators (trees) and a learning rate of 0.1. The learning rate controls how much each tree contributes to the final prediction, with lower values generally leading to better generalization at the cost of requiring more trees.</p>
+        
+        <p>We split our data into training (80%) and test (20%) sets using sklearn's train_test_split function. This allows us to evaluate our model on data it hasn't seen during training, giving us a more realistic estimate of its performance on new, unseen data.</p>
+        
+        <p>After training, we use the model to make predictions on the test set and evaluate its performance using accuracy score and a detailed classification report. This report provides precision, recall, and F1-score for each class, giving us a comprehensive view of the model's performance across different metrics.</p>
+        
+        
+        <div class="result">
+            <h3>Result:</h3>
+            <p>Model Accuracy: 0.9530</p>
+            <p>Classification Report:</p>
+            <pre>
+              precision    recall  f1-score   support
+
+           0       0.96      0.95      0.95    420229
+           1       0.95      0.96      0.95    420331
+
+    accuracy                           0.95    840560
+   macro avg       0.95      0.95      0.95    840560
+weighted avg       0.95      0.95      0.95    840560
+            </pre>
+        </div>
+        
+        <div class="interpretation">
+            <h3>Interpretation:</h3>
+            <p>Our XGBoost model demonstrates strong performance in predicting game outcomes, achieving an impressive accuracy of 95.30% on the test set. This high accuracy suggests that our engineered features capture significant and relevant information for predicting match results.</p>
+            
+            <p>Looking at the classification report, we see that the model performs consistently well for both classes (wins and losses). The precision, recall, and F1-scores are all around 0.95 for both classes, indicating a well-balanced model that doesn't favor one outcome over the other. This balance is crucial in a competitive gaming context, where accurately predicting both wins and losses is important.</p>
+            
+            <p>The high performance across all metrics suggests that our model has successfully captured the complex relationships between player skills, team compositions, and match outcomes. It's able to generalize well to unseen data, which is a strong indicator of its potential utility in real-world applications.</p>
+            
+            <p>However, it's important to note that while 95.30% accuracy is very high, there's still a small margin of error. This aligns with the inherent unpredictability in competitive gaming, where factors not captured in our data (like player communication, strategy, or even luck) can influence the outcome.</p>
+            
+            </div>
+        
+        <h2>4. Feature Importance</h2>
+        <pre><code>
+def plot_feature_importance(model, feature_names):
+    feature_importance = pd.DataFrame({
+        'feature': feature_names,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
+
+    fig = px.bar(feature_importance, x='importance', y='feature', orientation='h',
+                 title='Feature Importance')
+    fig.update_layout(yaxis={'categoryorder':'total ascending'})
+    return fig
+
+feature_importance_plot = plot_feature_importance(model, X.columns)
+        </code></pre>
+        
+        <p>This code calculates and plots the feature importance based on the trained XGBoost model.</p>
+        
+        <div id="feature-importance-plot"></div>
+        <script>
+            var feature_importance_data = {
+                type: 'bar',
+                x: [0.469615, 0.412452, 0.026172, 0.018079, 0.014792, 0.012881, 0.010648, 0.010602, 0.009248, 0.009215, 0.006295],
+                y: ['match_avg_rating', 'team_avg_rating', 'match_min_rating', 'team_min_rating', 'mu', 'sigma', 'match_rating', 'team_rating_spread', 'team_max_rating', 'match_max_rating', 'match_rating_spread'],
+                orientation: 'h'
+            };
+            var feature_importance_layout = {
+                title: 'Feature Importance',
+                yaxis: {categoryorder: 'total ascending'}
+            };
+            Plotly.newPlot('feature-importance-plot', [feature_importance_data], feature_importance_layout);
+        </script>
+        
+        <div class="interpretation">
+            <h3>Interpretation of Feature Importance</h3>
+            <p>The feature importance plot offers valuable insights into how our model predicts match outcomes in competitive gaming. At the forefront, we see that the average skill ratings, both at the match and team levels, emerge as the most crucial factors. This prominence of average ratings underscores the significance of overall skill balance in determining game results.</p>
+            
+            <p>Interestingly, our model places more weight on the minimum skill ratings than on the maximum ones, for both matches and teams. This suggests that in team-based competitive gaming, the performance of the least skilled players might have a more substantial impact on the outcome than the exceptional plays of the most skilled ones. It's a reminder that in team sports, a chain is often only as strong as its weakest link.</p>
+            
+            <p>Individual player characteristics, such as their skill rating (mu), uncertainty (sigma), and overall match rating, show moderate importance in our model. While these factors contribute to the prediction, their individual impact is less pronounced than the team and match averages. This aligns with the intuition that in team-based games, collective performance often outweighs individual brilliance.</p>
+            
+            <p>Perhaps surprisingly, the rating spreads - the difference between the highest and lowest skill ratings in a team or match - appear to be the least important features in our model. This could indicate that having a mix of high and low skilled players isn't as predictive of match outcomes as the overall skill level of the team or match.</p>
+            
+            <p>In essence, our model suggests that success in these competitive games is more about consistent, team-wide competence rather than relying on a few star players or being concerned about skill disparities within the team. It paints a picture of competitive gaming where balanced teams with a good baseline skill level are more likely to succeed than teams with a wider skill range.</p>
+            
+             </div>
+        
+        <h2>5. Confusion Matrix</h2>
+        <pre><code>
+def plot_confusion_matrix(y_test, y_pred):
+    cm = confusion_matrix(y_test, y_pred)
+    fig = px.imshow(cm, text_auto=True, aspect="auto",
+                    x=['Predicted 0', 'Predicted 1'],
+                    y=['Actual 0', 'Actual 1'],
+                    title='Confusion Matrix')
+    return fig
+
+confusion_matrix_plot = plot_confusion_matrix(y_test, y_pred)
+        </code></pre>
+        
+  
+        <p>The confusion matrix is a powerful tool for visualizing and understanding the performance of our classification model. It provides a tabular summary of the model's predictions compared to the actual outcomes, offering insights beyond simple accuracy metrics.</p>
+        
+        <p>In our implementation, we use the confusion_matrix function from scikit-learn to generate the matrix, and then visualize it using Plotly Express. The resulting heatmap provides an intuitive representation of the model's predictive performance across different classes.</p>
+        
+        <p>The matrix is structured as a 2x2 grid, where each cell represents a specific prediction scenario:
+        - True Negatives (top-left): Correctly predicted losses
+        - False Positives (top-right): Losses incorrectly predicted as wins
+        - False Negatives (bottom-left): Wins incorrectly predicted as losses
+        - True Positives (bottom-right): Correctly predicted wins</p>
+        
+        <p>In the context of game outcome prediction, false positives might represent matches where underdogs surprisingly won, while false negatives could be instances where favored teams unexpectedly lost. These misclassifications can provide valuable insights into the unpredictable nature of competitive gaming and the limitations of our current feature set.</p>
+
+        
+        <div id="confusion-matrix-plot"></div>
+        <script>
+            var confusion_matrix_data = {
+                z: [[399300, 20929], [18560, 401771]],
+                x: ['Predicted 0', 'Predicted 1'],
+                y: ['Actual 0', 'Actual 1'],
+                type: 'heatmap',
+                text: [[399300, 20929], [18560, 401771]],
+                texttemplate: "%{text}",
+                textfont: {"size": 20},
+                colorscale: 'Viridis'
+            };
+            var confusion_matrix_layout = {
+                title: 'Confusion Matrix',
+                xaxis: {title: 'Predicted'},
+                yaxis: {title: 'Actual'}
+            };
+            Plotly.newPlot('confusion-matrix-plot', [confusion_matrix_data], confusion_matrix_layout);
+        </script>
+        
+
+        <div class="interpretation">
+            <h3>Interpretation of the Confusion Matrix</h3>
+            <p>Our confusion matrix reveals a strong predictive performance across both win and loss scenarios. The high numbers along the main diagonal (399,300 true negatives and 401,771 true positives) indicate that our model correctly predicts the majority of both losses and wins.</p>
+            
+            <p>The model shows a slight tendency to err on the side of predicting wins, with 20,929 false positives compared to 18,560 false negatives. This small imbalance suggests that our model might be slightly more optimistic in predicting victories, perhaps capturing a bias in our feature set or in the underlying game dynamics.</p>
+            
+            <p>The near-symmetry of misclassifications is noteworthy, indicating that our model doesn't significantly favor one class over the other. This balance is crucial in a competitive gaming context, where accurately predicting both wins and losses is equally important.</p>
+            
+            <p>When we consider the total number of predictions (840,560), our misclassifications (39,489) represent only about 4.7% of all cases. This aligns with our previously calculated accuracy of 95.3%, confirming the model's strong overall performance.</p>
+            
+            <p>However, these misclassifications are not just errors to be minimized; they represent interesting cases where the game outcome defied the patterns our model has learned. They might indicate matches where underdogs triumphed or favorites unexpectedly lost, potentially due to factors our current feature set doesn't capture, such as player morale, team strategy, or in-game decisions.</p>
+            
+                    </div>
+        
+        <h2>6. Learning Curve</h2>
+        <pre><code>
+def plot_learning_curve(model, X, y):
+    train_sizes, train_scores, test_scores = learning_curve(
+        model, X, y, cv=5, n_jobs=-1, 
+        train_sizes=np.linspace(0.1, 1.0, 5))
+
+    train_scores_mean = np.mean(train_scores, axis=1)
+    test_scores_mean = np.mean(test_scores, axis=1)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=train_sizes, y=train_scores_mean, mode='lines+markers', name='Training score'))
+    fig.add_trace(go.Scatter(x=train_sizes, y=test_scores_mean, mode='lines+markers', name='Cross-validation score'))
+    fig.update_layout(title='Learning Curves', xaxis_title='Training Examples', yaxis_title='Score')
+    return fig
+
+learning_curve_plot = plot_learning_curve(model, X, y)
+        </code></pre>
+        
+        <p>This code generates a learning curve to show how the model's performance changes with increasing amounts of training data.</p>
+        
+        <div id="learning-curve-plot"></div>
+        <script>
+            var learning_curve_data = [
+                {
+                    x: [336223, 1092727, 1849230, 2605734, 3362238],
+                    y: [0.967301, 0.973355, 0.962186, 0.951215, 0.952882],
+                    mode: 'lines+markers',
+                    name: 'Training score'
+                },
+                {
+                    x: [336223, 1092727, 1849230, 2605734, 3362238],
+                    y: [0.928123, 0.945342, 0.947972, 0.947452, 0.950596],
+                    mode: 'lines+markers',
+                    name: 'Cross-validation score'
+                }
+            ];
+            var learning_curve_layout = {
+                title: 'Learning Curves',
+                xaxis: {title: 'Training Examples'},
+                yaxis: {title: 'Score'}
+            };
+            Plotly.newPlot('learning-curve-plot', learning_curve_data, learning_curve_layout);
+        </script>
+        
+        <div class="interpretation">
+            <h3>Interpretation:</h3>
+            <p>The learning curve provides several insights:</p>
+            <ol>
+                <li>Both training and cross-validation scores are high, even with a small number of training examples, indicating that our features are highly informative.</li>
+                <li>The gap between training and cross-validation scores narrows as we increase the number of training examples, suggesting that more data helps reduce overfitting.</li>
+                <li>The cross-validation score continues to improve slightly as we add more data, hinting that we might benefit from even more training data if available.</li>
+                <li>The high scores achieved with relatively few training examples suggest that our model could potentially be trained on a smaller dataset without significant loss of performance, which could be beneficial for faster iteration or deployment in resource-constrained environments.</li>
+            </ol>
+        </div>
+        
+        <h2>7. Cross-Validation Results</h2>
+        <pre><code>
+def perform_cross_validation(model, X, y):
+    cv_scores = cross_val_score(model, X, y, cv=5)
+    return cv_scores
+
+cv_scores = perform_cross_validation(model, X, y)
+        </code></pre>
+        
+        <p>Cross-validation is a crucial technique in machine learning that helps us assess how well our model generalizes to unseen data. In this case, we employ 5-fold cross-validation, which involves dividing our dataset into five equal parts, or folds. The model is then trained on four folds and tested on the remaining fold, with this process repeated five times so that each fold serves as the test set once. This approach provides a robust estimate of the model's performance across different subsets of our data.</p>
+ 
+        
+        <div class="result">
+            <h3>Result:</h3>
+            <p>Cross-validation scores: [0.97381508, 0.96557771, 0.9432997, 0.93120293, 0.93787111]</p>
+            <p>Mean CV score: 0.9504 (+/- 0.0329)</p>
+        </div>
+        
+        <div class="interpretation">
+            <h3>Interpretation of Cross-Validation Results</h3>
+            <p>The cross-validation results offer valuable insights into our model's performance and reliability. The mean cross-validation score of 0.9504 is remarkably close to our test set accuracy of 0.9530, which is a strong indication of our model's consistency and robustness. This similarity suggests that our model's performance on the test set was not a fluke, but rather a reliable representation of its general predictive capability.</p>
+            
+            <p>The standard deviation of the scores, at 0.0329, is relatively small. This low variance across folds is encouraging, as it indicates that our model's performance remains stable across different subsets of the data. Such stability is crucial in real-world applications, where we need our model to perform consistently across various scenarios and player populations.</p>
+            
+            <p>It's particularly noteworthy that even the lowest cross-validation score (0.93120293) is still very high. This further reinforces our confidence in the model's reliability, showing that even in its "worst" performance, it still achieves over 93% accuracy. This consistency across folds suggests that our feature set and model architecture are robust to variations in the data.</p>
+          
+            <p>In conclusion, the cross-validation results paint a picture of a highly effective and stable model. The high mean score, low standard deviation, and consistently strong performance across all folds give us confidence in our model's ability to generalize to new, unseen data. At the same time, the small variations between folds remind us of the complex nature of game outcome prediction and hint at potential areas for further investigation and model refinement.</p>
+        </div>
+        
+        <h2>Conclusions</h2>
+        <p>Our XGBoost model for predicting game outcomes in competitive team-based matches has demonstrated excellent performance, with high accuracy and consistency across various evaluation metrics.:</p>
+
+            <ol>
+                <li>Model Performance: The model achieves an impressive 95.30% accuracy on the test set and a 95.04% mean cross-validation score, demonstrating robust and reliable performance. This high accuracy, achieved using primarily skill-based features, suggests that the game's skill rating system (mu and sigma values) effectively captures players' true abilities and their likelihood of winning.</li>
+            
+                <li>Feature Importance: 
+                    <ul>
+                        <li>Average skill ratings, both at the match and team level, are the most crucial factors in predicting match outcomes.</li>
+                        <li>Team-level metrics (particularly average and minimum ratings) outweigh individual player ratings in importance, indicating that the matchmaking system effectively balances teams as a whole.</li>
+                        <li>Minimum skill ratings have more impact on predictions than maximum ratings, suggesting that the performance of the lowest-skilled player on a team significantly influences the match outcome. This implies that the game design may reward team cohesion and support for weaker team members over individual star player performances.</li>
+                    </ul>
+                </li>
+            
+                <li>Matchmaking Effectiveness: The high predictive power of average team ratings suggests that the matchmaking system successfully groups players of similar skill levels. The absence of strong emphasis on individual player ratings or rating spreads in our model indicates that matches are generally well-balanced.</li>
+            
+                <li>Feature Engineering: The model's strong performance, even with a relatively small number of training examples, suggests that our engineered features effectively capture the essential aspects of what determines match outcomes.</li>
+            </ol>
+
+        
+       </div>
+</body>
+</html>
